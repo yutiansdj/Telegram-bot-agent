@@ -1,0 +1,330 @@
+/**
+ * MTProto 代理内核管理（mtprotoproxy）
+ *
+ * 为什么不再用 mtg：
+ *   mtg v2 已彻底移除传统 MTProxy 协议，只接受 ee(FakeTLS) 形态。实测在多种客户端下，
+ *   mtg 对本应合法的握手直接判定为探测流量并转发到伪装站点（domain_fronting 计数上涨、
+ *   client_connections 恒为 0），表现为 Telegram「一会连上一会正在连接」。
+ *   mtprotoproxy 同时兼容 传统 MTProxy(16/17 字节) 与 FakeTLS(ee) 两种链接，
+ *   真实客户端实测连续收发正常，故作为默认内核。
+ *
+ * 计费：每个账号使用独立系统 UID 运行进程，由 iptables owner 模块精确计量（见 billing.js）。
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn, execFileSync } from 'node:child_process';
+import net from 'node:net';
+import { config } from './config.js';
+import { db, getSetting, getSettingNum } from './db.js';
+import * as billing from './billing.js';
+
+const running = new Map(); // accountId -> { proc, port, pid, startedAt }
+const restartState = new Map(); // accountId -> { count, timer }
+let shuttingDown = false;
+
+function detectCore() {
+  try {
+    const raw = execFileSync('ip', ['-j', 'addr', 'show', 'scope', 'global'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const ifaces = JSON.parse(raw);
+    let ipv4 = '';
+    const ipv6 = [];
+    const ifname = [];
+    for (const iface of ifaces) {
+      ifname.push(iface.ifname);
+      for (const a of iface.addr_info || []) {
+        const ip = String(a.local || '').split('/')[0];
+        if (a.family === 'inet6') { if (ip.startsWith('fe80') || ip === '::1') continue; ipv6.push(ip); }
+        else if (a.family === 'inet' && !ip.startsWith('127.')) ipv4 = ip;
+      }
+    }
+    let publicIp = '';
+    try { publicIp = execFileSync('curl', ['-s4', '--max-time', '5', 'https://api.ipify.org'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* ignore */ }
+    return { ipv4, ipv6, ifname: [...new Set(ifname)], publicIp };
+  } catch {
+    return { ipv4: '', ipv6: [], ifname: [], publicIp: '' };
+  }
+}
+
+export const CORE = detectCore();
+
+function accountDir(id) {
+  const d = path.join(config.instanceDir, String(id));
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+export function instancePath(id, file) {
+  return path.join(accountDir(id), file);
+}
+
+export function resolvePublicIp(node) {
+  const s = getSetting('node_public_ip').trim();
+  if (node && node.public_ip && node.public_ip.trim()) return node.public_ip.trim();
+  if (s) return s;
+  return CORE.publicIp || node?.host || '';
+}
+
+function hexToBytes(hex) {
+  const out = Buffer.alloc(Math.floor(hex.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * 生成客户端可用的代理链接（同时提供三种 secret 形态）
+ *   - tmeStandard : 16 字节 hex 私钥（最兼容，推荐）
+ *   - tmeDd       : dd + hex 私钥（传统 MTProxy 兼容写法）
+ *   - tmeFakeTls  : ee + hex 私钥 + hex(伪装域名)（FakeTLS 抗封锁）
+ */
+export function genClientLinks(acc) {
+  const node = db.prepare('SELECT * FROM nodes WHERE id = ?').get(acc.node_id);
+  if (!node) return null;
+  const ip = resolvePublicIp(node);
+  const keyHex = (acc.secret || '').slice(0, 32); // 16 字节私钥
+  const domain = getSetting('fake_domains').split(',')[0]?.trim() || 'vpn.ack4.cn';
+  const mk = (sec) => ({
+    tme: `https://t.me/proxy?server=${encodeURIComponent(ip)}&port=${acc.port}&secret=${sec}`,
+    tg: `tg://proxy?server=${encodeURIComponent(ip)}&port=${acc.port}&secret=${sec}`,
+  });
+  const standard = mk(keyHex);
+  const dd = mk(`dd${keyHex}`);
+  const fakeKey = Buffer.from(`ee${keyHex}${Buffer.from(domain, 'utf8').toString('hex')}`, 'hex');
+  const tls = mk(b64url(fakeKey));
+  return {
+    ip, port: acc.port, node: node.name,
+    // 默认推荐：标准 16 字节私钥
+    ...standard,
+    secret: keyHex, rawSecret: keyHex,
+    variants: {
+      standard: { label: '标准（推荐）', ...standard },
+      dd: { label: '传统 dd 格式', ...dd },
+      faketls: { label: 'FakeTLS 抗封锁', ...tls, domain },
+    },
+  };
+}
+
+export function findFreePort(nodeId, base) {
+  const node = db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  if (!node) throw new Error('节点不存在');
+  const used = new Set(db.prepare('SELECT port FROM accounts WHERE node_id = ?').all(nodeId).map((r) => r.port));
+  const start = Number(base || node.port_base || 20000);
+  const range = Number(node.port_range || 1000);
+  for (let i = 0; i < range; i++) {
+    const p = start + i;
+    if (!used.has(p) && !portInUse(p)) return p;
+  }
+  throw new Error('端口池已耗尽，请调整该节点的端口范围');
+}
+
+function portInUse(p) {
+  for (const v of running.values()) if (v.port === p) return true;
+  return false;
+}
+
+const PYTHON = '/opt/tgproxy/venv/bin/python';
+const ENTRY = '/opt/tgproxy/venv/bin/mtprotoproxy.py';
+
+/** 生成 mtprotoproxy 的配置文件（每个账号一份） */
+function writeConfig(acc, uid) {
+  const dir = accountDir(acc.id);
+  const keyHex = (acc.secret || '').slice(0, 32);
+  const domain = getSetting('fake_domains').split(',')[0]?.trim() || 'vpn.ack4.cn';
+  const cfg = `# account ${acc.id} - generated by tgproxy platform
+PORT = ${acc.port}
+USERS = {"u${acc.id}": "${keyHex}"}
+
+# 同时兼容传统 MTProxy 与 FakeTLS 两种客户端协议
+SECURE_ONLY = False
+TLS_ONLY = False
+TLS_DOMAIN = "${domain}"
+MASK = False
+FAST_MODE = True
+
+# 数据目录（日志）
+LOG_DIR = "${dir}"
+`;
+  const file = path.join(dir, 'config.py');
+  fs.writeFileSync(file, cfg);
+  try { fs.chownSync(file, uid, uid); } catch { /* ignore */ }
+  return { dir, file, keyHex };
+}
+
+export function isAccountEnabled(acc) {
+  if (!acc) return false;
+  if (acc.status !== 'active') return false;
+  if (acc.expires_at) {
+    const t = new Date(acc.expires_at.replace(' ', 'T') + (acc.expires_at.includes('Z') ? '' : 'Z')).getTime();
+    if (Number.isFinite(t) && t < Date.now()) return false;
+  }
+  if (acc.quota_mb > 0 && acc.used_bytes >= acc.quota_mb * 1024 * 1024) return false;
+  return true;
+}
+
+export function accountState(acc) {
+  if (acc.status === 'disabled') return 'disabled';
+  if (acc.expires_at) {
+    const t = new Date(acc.expires_at.replace(' ', 'T') + 'Z').getTime();
+    if (Number.isFinite(t) && t < Date.now()) return 'expired';
+  }
+  if (acc.quota_mb > 0 && acc.used_bytes >= acc.quota_mb * 1024 * 1024) return 'exhausted';
+  return running.has(acc.id) ? 'running' : 'stopped';
+}
+
+export async function startAccount(acc, { silent = false } = {}) {
+  if (shuttingDown) return { ok: false, reason: 'shutting-down' };
+  if (running.has(acc.id)) return { ok: true, already: true };
+  if (!isAccountEnabled(acc)) return { ok: false, reason: 'not-enabled' };
+
+  const uid = await billing.ensureUser(acc.id);
+  const { file, dir } = writeConfig(acc, uid);
+  const logPath = path.join(dir, 'access.log');
+  const out = fs.openSync(logPath, 'a');
+  try { fs.chownSync(dir, uid, uid); fs.chownSync(logPath, uid, uid); } catch { /* ignore */ }
+  await billing.applyRules(acc, true).catch(() => {});
+
+  let proc;
+  try {
+    proc = spawn(PYTHON, [ENTRY, file], {
+      uid, gid: uid, stdio: ['ignore', out, out], env: { ...process.env, HOME: dir, PYTHONUNBUFFERED: '1' },
+    });
+  } catch (e) {
+    fs.closeSync(out);
+    if (!silent) console.error(`[proxy] start ${acc.id} failed:`, e.message);
+    return { ok: false, reason: e.message };
+  }
+  fs.closeSync(out);
+
+  const entry = { proc, port: acc.port, pid: proc.pid, startedAt: Date.now() };
+  running.set(acc.id, entry);
+  proc.on('exit', (code, sig) => {
+    running.delete(acc.id);
+    if (shuttingDown || silent) return;
+    if (code !== 0 && code !== null) console.warn(`[proxy] account ${acc.id} exited code=${code} sig=${sig}`);
+    scheduleRestart(acc.id);
+  });
+  proc.on('error', (e) => console.error(`[proxy] account ${acc.id} spawn error`, e.message));
+  const st = restartState.get(acc.id);
+  if (st?.timer) { clearTimeout(st.timer); restartState.set(acc.id, { count: 0, timer: null }); }
+  return { ok: true, pid: proc.pid };
+}
+
+function scheduleRestart(accountId) {
+  if (shuttingDown) return;
+  const st = restartState.get(accountId) || { count: 0, timer: null };
+  if (st.count > 50 || st.timer) return;
+  const delay = Math.min(30000, 2000 * (st.count + 1));
+  const timer = setTimeout(async () => {
+    restartState.set(accountId, { count: st.count + 1, timer: null });
+    const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(accountId);
+    if (!acc || !isAccountEnabled(acc) || running.has(accountId)) return;
+    await startAccount(acc, { silent: true }).catch(() => {});
+  }, delay);
+  restartState.set(accountId, { count: st.count, timer });
+}
+
+export function stopAccount(id) {
+  const e = running.get(id);
+  running.delete(id);
+  if (!e) return false;
+  try { e.proc.kill('SIGTERM'); } catch { /* ignore */ }
+  setTimeout(() => { try { e.proc.kill('SIGKILL'); } catch { /* ignore */ } }, 3000);
+  return true;
+}
+
+export function getRunningEntry(id) {
+  return running.get(id) || null;
+}
+
+export async function reloadAccount(acc) {
+  stopAccount(acc.id);
+  await new Promise((r) => setTimeout(r, 400));
+  if (isAccountEnabled(acc)) await startAccount(acc);
+  return { ok: true, state: accountState(acc) };
+}
+
+export function runningAccounts() {
+  return [...running.entries()].map(([id, e]) => ({ id, pid: e.pid, port: e.port, startedAt: e.startedAt }));
+}
+
+export async function startAll() {
+  const list = db.prepare('SELECT * FROM accounts').all();
+  let started = 0;
+  for (const acc of list) {
+    if (isAccountEnabled(acc)) { startAccount(acc, { silent: true }).catch(() => {}); started++; }
+  }
+  return { total: list.length, started };
+}
+
+export function stopAll() {
+  shuttingDown = true;
+  for (const id of [...running.keys()]) stopAccount(id);
+}
+
+export function checkPort(port, host = '127.0.0.1', timeout = 900) {
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; s.destroy(); resolve(r); } };
+    s.setTimeout(timeout);
+    s.on('connect', () => finish(true));
+    s.on('timeout', () => finish(false));
+    s.on('error', () => finish(false));
+    s.connect(port, host);
+  });
+}
+
+export function checkTcp(host, port, timeout = 1500) {
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    const started = Date.now();
+    const finish = (r) => { try { s.destroy(); } catch { /* ignore */ } resolve(r ? Date.now() - started : -1); };
+    s.setTimeout(timeout);
+    s.on('connect', () => finish(true));
+    s.on('timeout', () => finish(false));
+    s.on('error', () => finish(false));
+    s.connect(port, host);
+  });
+}
+
+const TELEGRAM_DCS = ['149.154.167.51', '91.108.56.130', '149.154.175.53'];
+export async function checkTelegramDC() {
+  const lat = await Promise.all(TELEGRAM_DCS.map((ip) => checkTcp(ip, 443, 1500)));
+  const valid = lat.filter((v) => v >= 0);
+  return { ok: valid.length > 0, latency: valid.length ? Math.min(...valid) : 0 };
+}
+
+export async function checkNodeHealth(node) {
+  const accs = db.prepare('SELECT port, status FROM accounts WHERE node_id = ? ORDER BY id DESC LIMIT 10').all(node.id);
+  const active = accs.filter((a) => a.status === 'active').slice(0, 3);
+  const ports = active.map((a) => a.port);
+  if (ports.length === 0) ports.push(node.port_base);
+  const results = await Promise.all(ports.map((p) => checkPort(p)));
+  const listening = results.filter(Boolean).length;
+  const dc = await checkTelegramDC();
+  return {
+    online: listening > 0 && dc.ok, listening, total: ports.length,
+    dcOk: dc.ok, dcLatency: dc.latency, accounts: accs.length, latencyMs: dc.latency,
+  };
+}
+
+export function ensureNodeDefaults() {
+  const c = db.prepare('SELECT COUNT(*) AS c FROM nodes').get().c;
+  if (c === 0) {
+    const ip = CORE.publicIp || '154.222.24.221';
+    db.prepare(`INSERT INTO nodes(name, host, ip_version, port_base, port_range, status, public_ip, note)
+                VALUES(?, ?, 'ipv4', 20000, 1000, 'online', ?, '本机主节点 · IPv4 直连')`)
+      .run('主节点', ip, ip);
+  }
+}
+
+export async function loadBalanceCheck(acc) {
+  const node = db.prepare('SELECT * FROM nodes WHERE id = ?').get(acc.node_id);
+  const ip = resolvePublicIp(node);
+  const local = await checkPort(acc.port, '127.0.0.1');
+  const remote = await checkTcp(ip, acc.port, 3000);
+  return { local, remote: remote >= 0, remoteMs: remote, ip };
+}
